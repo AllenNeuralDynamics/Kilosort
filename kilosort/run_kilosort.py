@@ -364,6 +364,166 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
            is_ref, est_contam_rate, kept_spikes
 
 
+def apply_templates(training_dir, filename, results_dir=None, tmin=0.0,
+                    tmax=np.inf, device=None, file_object=None,
+                    progress_bar=None, verbose_console=False,
+                    torch_thread_lim=None):
+    """Extract spikes from a recording using frozen templates from a prior run.
+
+    Runs only the basis-pursuit (matching-pursuit) stage of Kilosort4 against
+    a fixed template bank `Wall` loaded from a previous `run_kilosort` run.
+    Skips drift correction, universal-template detection, clustering, and
+    merging, so the final cluster IDs are identical to those produced during
+    training.
+
+    This is intended for very long recordings where a full sort is infeasible
+    but a short training window is representative.
+
+    Requires the training run to have been performed with `nblocks=0` (so
+    that `ops['dshift'] is None`) and `save_extra_vars=True` (so that
+    `Wall.npy` exists alongside `ops.npy`).
+
+    Parameters
+    ----------
+    training_dir : str or Path
+        Directory containing `ops.npy` and `Wall.npy` from a prior KS4 run.
+    filename : Path-like or list of Path-likes
+        Binary file(s) to extract from. Must match the training recording in
+        channel count, sampling rate, dtype, and probe geometry.
+    results_dir : str or Path; optional.
+        Output directory. Defaults to `filename.parent / 'kilosort4_apply'`.
+    tmin, tmax : float; optional.
+        Time range (seconds) within `filename` to extract. Defaults to the
+        full recording.
+    device : torch.device; optional.
+        Defaults to CUDA if available, else CPU.
+    file_object : array-like; optional.
+        Alternative to reading from disk; see `run_kilosort`.
+    progress_bar : optional.
+        Forwarded to `template_matching.extract`.
+    verbose_console : bool; optional.
+        If True, set console logging level to DEBUG.
+    torch_thread_lim : int; optional.
+        If set, limits pytorch CPU thread count.
+
+    Returns
+    -------
+    ops, st, clu, tF, Wall, similar_templates, is_ref, est_contam_rate,
+    kept_spikes : same shapes/types as `run_kilosort`.
+
+    Notes
+    -----
+    Memory: `tF` is held in RAM for the full recording before `save_to_phy`.
+    A 24-hr recording with ~200 units firing at ~10 Hz and default
+    `nearest_chans`/`n_pcs` needs ~40 GB of host memory for `tF`. If this is
+    a problem, reduce the time range or run in segments.
+    """
+    if torch_thread_lim is not None:
+        torch.set_num_threads(torch_thread_lim)
+
+    training_dir = Path(training_dir)
+    if not isinstance(filename, list):
+        filename = [filename]
+    filename = [Path(f) for f in filename]
+    for f in filename:
+        if not f.exists():
+            raise FileExistsError(f"filename '{f}' does not exist")
+
+    if results_dir is None:
+        results_dir = filename[0].parent / 'kilosort4_apply'
+    results_dir = Path(results_dir).resolve()
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    setup_logger(results_dir, verbose_console=verbose_console)
+    try:
+        tic0 = time.time()
+        logger.info(f"Kilosort version {kilosort.__version__}")
+        logger.info(f"Python version {platform.python_version()}")
+        logger.info('-'*40)
+        logger.info(f'apply_templates: training_dir={training_dir}')
+        logger.info(f'apply_templates: target filename={filename}')
+        logger.info(f'apply_templates: tmin={tmin}, tmax={tmax}')
+
+        if device is None:
+            if torch.cuda.is_available():
+                device = torch.device('cuda')
+            else:
+                device = torch.device('cpu')
+        logger.info(f'Using device: {device}')
+
+        ops_path = training_dir / 'ops.npy'
+        wall_path = training_dir / 'Wall.npy'
+        if not ops_path.exists():
+            raise FileNotFoundError(f'ops.npy not found in {training_dir}')
+        if not wall_path.exists():
+            raise FileNotFoundError(
+                f'Wall.npy not found in {training_dir}. '
+                'Re-run training with save_extra_vars=True.'
+            )
+
+        ops = io.load_ops(ops_path, device=device)
+        Wall = torch.from_numpy(np.load(wall_path)).to(device)
+        logger.info(f'Loaded frozen templates: Wall shape {tuple(Wall.shape)}')
+
+        if ops.get('dshift') is not None:
+            raise ValueError(
+                'apply_templates requires training with nblocks=0 so that '
+                "ops['dshift'] is None. Re-run training with nblocks=0."
+            )
+
+        # Override filename and time range; everything else stays frozen.
+        ops['filename'] = filename
+        ops['data_dir'] = filename[0].parent
+        ops['settings']['filename'] = filename
+        ops['settings']['data_dir'] = filename[0].parent
+        ops['settings']['tmin'] = float(tmin)
+        ops['settings']['tmax'] = float(tmax)
+        ops['tmin'] = float(tmin)
+        ops['tmax'] = float(tmax)
+
+        n_chan_bin, fs, NT, nt, twav_min, chan_map, dtype, do_CAR, invert, \
+            _, _, _, _, artifact, shift, scale, batch_ds = \
+                get_run_parameters(ops)
+
+        bfile = io.BinaryFiltered(
+            ops['filename'], n_chan_bin, fs, NT, nt, twav_min, chan_map,
+            hp_filter=ops['fwav'], whiten_mat=ops['Wrot'], dshift=None,
+            device=device, do_CAR=do_CAR, invert_sign=invert, dtype=dtype,
+            tmin=tmin, tmax=tmax, artifact_threshold=artifact,
+            shift=shift, scale=scale, file_object=file_object,
+            batch_downsampling=batch_ds,
+        )
+        ops['Nbatches'] = bfile.n_batches
+        logger.info(f'N samples: {bfile.n_samples}')
+        logger.info(f'N seconds: {bfile.n_samples/fs}')
+        logger.info(f'N batches: {bfile.n_batches}')
+
+        logger.info(' ')
+        logger.info('Extracting spikes with frozen templates')
+        logger.info('-'*40)
+        tic = time.time()
+        st, tF, ops = template_matching.extract(
+            ops, bfile, Wall, device=device, progress_bar=progress_bar,
+        )
+        logger.info(f'{len(st)} spikes extracted in {time.time()-tic:.2f}s')
+        clu = st[:, 1].astype('int32')
+
+        ops, similar_templates, is_ref, est_contam_rate, kept_spikes = \
+            save_sorting(
+                ops, results_dir, st, clu, tF, Wall, bfile.imin, tic0=tic0,
+                save_extra_vars=False, save_preprocessed_copy=False,
+                skip_dat_path=(file_object is not None),
+            )
+    except Exception:
+        logger.exception('Encountered error in `apply_templates`:')
+        raise
+    finally:
+        close_logger()
+
+    return ops, st, clu, tF, Wall, similar_templates, \
+           is_ref, est_contam_rate, kept_spikes
+
+
 def set_files(settings, filename, probe, probe_name, data_dir, results_dir,
               bad_channels, shank_idx):
     """Parse file and directory information for data, probe, and results."""
