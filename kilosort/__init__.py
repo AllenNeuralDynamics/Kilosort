@@ -7,5 +7,5 @@ except importlib.metadata.PackageNotFoundError:
     pass
 
 from .utils import PROBE_DIR, DOWNLOADS_DIR
-from .run_kilosort import run_kilosort, apply_templates
+from .run_kilosort import run_kilosort, apply_templates, apply_templates_chunked
 from .parameters import DEFAULT_SETTINGS

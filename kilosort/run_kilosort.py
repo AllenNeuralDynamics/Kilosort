@@ -1,6 +1,7 @@
 import time
 from pathlib import Path
 import logging
+import shutil
 import warnings
 import platform
 logger = logging.getLogger(__name__)
@@ -9,8 +10,8 @@ import numpy as np
 import torch
 
 import kilosort
-from kilosort import (preprocessing, datashift, template_matching, clustering_qr, 
-                      clustering_qr, io, spikedetect, CCG, PROBE_DIR)
+from kilosort import (preprocessing, datashift, template_matching, clustering_qr,
+                      clustering_qr, io, spikedetect, CCG, PROBE_DIR, postprocessing)
 from kilosort.parameters import DEFAULT_SETTINGS
 from kilosort.utils import (
     log_performance, log_cuda_details, probe_as_string, ops_as_string,
@@ -372,16 +373,23 @@ def apply_templates(training_dir, filename, results_dir=None, tmin=0.0,
 
     Runs only the basis-pursuit (matching-pursuit) stage of Kilosort4 against
     a fixed template bank `Wall` loaded from a previous `run_kilosort` run.
-    Skips drift correction, universal-template detection, clustering, and
-    merging, so the final cluster IDs are identical to those produced during
-    training.
+    Skips universal-template spike detection, clustering, and merging, so the
+    final cluster IDs are identical to those produced during training.
+
+    If the training run used drift correction (`nblocks >= 1`), drift is
+    re-estimated on the target recording (independently of the training
+    drift) and applied before template matching. This produces a per-batch
+    `dshift` sized to the target bfile, using the target recording's own
+    average fingerprint as the reference. For chronic probes with small
+    drift, the difference between the training reference frame and the
+    target reference frame is typically well below `binning_depth`, so
+    templates still match.
 
     This is intended for very long recordings where a full sort is infeasible
     but a short training window is representative.
 
-    Requires the training run to have been performed with `nblocks=0` (so
-    that `ops['dshift'] is None`) and `save_extra_vars=True` (so that
-    `Wall.npy` exists alongside `ops.npy`).
+    Requires the training run to have been performed with `save_extra_vars=True`
+    so that `Wall.npy` exists alongside `ops.npy`.
 
     Parameters
     ----------
@@ -465,11 +473,12 @@ def apply_templates(training_dir, filename, results_dir=None, tmin=0.0,
         Wall = torch.from_numpy(np.load(wall_path)).to(device)
         logger.info(f'Loaded frozen templates: Wall shape {tuple(Wall.shape)}')
 
-        if ops.get('dshift') is not None:
-            raise ValueError(
-                'apply_templates requires training with nblocks=0 so that '
-                "ops['dshift'] is None. Re-run training with nblocks=0."
-            )
+        # Discard training's dshift; it's indexed by training batches and
+        # would be wrong to apply to the target bfile. If the training run
+        # used drift (nblocks >= 1), we recompute dshift on the target bfile
+        # below.
+        ops['dshift'] = None
+        nblocks = int(ops.get('nblocks', 0))
 
         # Override filename and time range; everything else stays frozen.
         ops['filename'] = filename
@@ -498,6 +507,27 @@ def apply_templates(training_dir, filename, results_dir=None, tmin=0.0,
         logger.info(f'N seconds: {bfile.n_samples/fs}')
         logger.info(f'N batches: {bfile.n_batches}')
 
+        if nblocks >= 1:
+            logger.info(' ')
+            logger.info(f'Recomputing drift on target recording (nblocks={nblocks})')
+            logger.info('-'*40)
+            tic = time.time()
+            ops, st0 = datashift.run(
+                ops, bfile, device=device, progress_bar=progress_bar,
+            )
+            logger.info(f'drift recomputed in {time.time()-tic:.2f}s')
+            if st0 is not None:
+                kplots.plot_drift_amount(ops, results_dir, tmin=float(tmin))
+                kplots.plot_drift_scatter(st0, results_dir, tmin=float(tmin))
+            bfile = io.BinaryFiltered(
+                ops['filename'], n_chan_bin, fs, NT, nt, twav_min, chan_map,
+                hp_filter=ops['fwav'], whiten_mat=ops['Wrot'],
+                dshift=ops['dshift'], device=device, do_CAR=do_CAR,
+                invert_sign=invert, dtype=dtype, tmin=tmin, tmax=tmax,
+                artifact_threshold=artifact, shift=shift, scale=scale,
+                file_object=file_object, batch_downsampling=batch_ds,
+            )
+
         logger.info(' ')
         logger.info('Extracting spikes with frozen templates')
         logger.info('-'*40)
@@ -522,6 +552,360 @@ def apply_templates(training_dir, filename, results_dir=None, tmin=0.0,
 
     return ops, st, clu, tF, Wall, similar_templates, \
            is_ref, est_contam_rate, kept_spikes
+
+
+def apply_templates_chunked(training_dir, filename, chunk_hours=4.0,
+                            chunk_ranges=None, results_dir=None,
+                            tmin=0.0, tmax=np.inf, stitch_training=False,
+                            keep_chunks=False, device=None, file_object=None,
+                            progress_bar=None, verbose_console=False,
+                            torch_thread_lim=None):
+    """Run `apply_templates` in chunks and merge the phy outputs.
+
+    Splits the target recording into time chunks, runs `apply_templates` on
+    each chunk to a temporary phy directory, then merges the per-chunk phy
+    outputs into a single phy directory at `results_dir`.
+
+    Peak host RAM is bounded by a single chunk's `tF` (plus the merge step,
+    which mmaps the per-chunk `pc_features.npy` files).
+
+    Parameters
+    ----------
+    training_dir : str or Path
+        Directory containing `ops.npy` and `Wall.npy` from a prior KS4 run.
+    filename : Path-like or list of Path-likes
+        Target binary file(s). A list is treated as one virtual recording
+        concatenated in the given order, independent of chunk boundaries.
+    chunk_hours : float; default=4.0
+        Chunk duration in hours when `chunk_ranges` is None.
+    chunk_ranges : list of (float, float); optional
+        Explicit chunk boundaries as (t_start, t_end) pairs in seconds.
+        Overrides `chunk_hours`. Ranges must be disjoint and in increasing
+        order. Useful for aligning chunks with physical file boundaries.
+    results_dir : str or Path; optional
+        Output directory. Defaults to `filename.parent / 'kilosort4_apply'`.
+    tmin, tmax : float; optional
+        Overall time range to cover across chunks.
+    stitch_training : bool; default=False
+        If True, include the training window (loaded from
+        `training_dir/ops.npy`'s tmin/tmax) as one of the inputs to the
+        merge, and skip any chunk that overlaps it. Use this only if you
+        want to preserve training's saved spike train; note that training
+        spikes were extracted with first-pass templates while apply chunks
+        use the frozen final templates, so the merged output will have a
+        small methodological discontinuity at the train/apply boundary.
+    keep_chunks : bool; default=False
+        If True, leave the per-chunk phy directories in place after the
+        merge (named `_chunk_0000/`, etc. under `results_dir`).
+    device, file_object, progress_bar, verbose_console, torch_thread_lim
+        Forwarded to each chunk's `apply_templates` call.
+
+    Returns
+    -------
+    results_dir : Path
+        Path to the merged phy output directory.
+
+    Notes
+    -----
+    Each chunk writes a full phy directory via `apply_templates` (which
+    calls `save_to_phy`). The merge step concatenates the per-spike
+    arrays (already sorted within each chunk and chunks are time-disjoint,
+    so the concatenation is already time-sorted), runs a final
+    cross-chunk `remove_duplicates` on the merged spike train, copies the
+    cluster-level / channel-level / whitening files from the first chunk
+    (they're identical across chunks because `Wall` is frozen), and
+    recomputes `cluster_KSLabel.tsv`/`cluster_ContamPct.tsv` from the
+    merged train via `CCG.refract`.
+    """
+    if torch_thread_lim is not None:
+        torch.set_num_threads(torch_thread_lim)
+
+    training_dir = Path(training_dir)
+    if not isinstance(filename, list):
+        filename = [filename]
+    filename = [Path(f) for f in filename]
+    for f in filename:
+        if not f.exists():
+            raise FileExistsError(f"filename '{f}' does not exist")
+    if results_dir is None:
+        results_dir = filename[0].parent / 'kilosort4_apply'
+    results_dir = Path(results_dir).resolve()
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Peek at training ops to get fs, n_chan_bin, dtype, and training range.
+    ops_peek = io.load_ops(training_dir / 'ops.npy', device=torch.device('cpu'))
+    fs = float(ops_peek['fs'])
+    n_chan_bin = int(ops_peek['n_chan_bin'])
+    data_dtype = ops_peek['data_dtype']
+
+    # Compute recording duration honoring file_object if provided.
+    if file_object is not None:
+        total_samples = file_object.shape[0]
+    elif len(filename) > 1:
+        total_samples = sum(
+            io.get_total_samples(f, n_chan_bin, data_dtype) for f in filename
+        )
+    else:
+        total_samples = io.get_total_samples(filename[0], n_chan_bin, data_dtype)
+    total_sec = total_samples / fs
+    effective_tmin = max(0.0, float(tmin))
+    effective_tmax = total_sec if not np.isfinite(tmax) else min(float(tmax), total_sec)
+    if effective_tmin >= effective_tmax:
+        raise ValueError(
+            f'Empty time range: tmin={effective_tmin} >= tmax={effective_tmax}'
+        )
+
+    # Resolve training range if stitching.
+    train_range = None
+    if stitch_training:
+        train_tmin = float(ops_peek.get('tmin', 0.0))
+        train_tmax_raw = ops_peek.get('tmax', np.inf)
+        train_tmax = (total_sec if not np.isfinite(train_tmax_raw)
+                      else float(train_tmax_raw))
+        train_range = (train_tmin, train_tmax)
+
+    # Build chunk schedule.
+    if chunk_ranges is None:
+        if chunk_hours is None or chunk_hours <= 0:
+            raise ValueError('Either `chunk_hours > 0` or `chunk_ranges` must be given.')
+        chunk_sec = float(chunk_hours) * 3600.0
+        ranges = []
+        t = effective_tmin
+        while t < effective_tmax:
+            ranges.append((t, min(t + chunk_sec, effective_tmax)))
+            t += chunk_sec
+    else:
+        # Validate and clamp user-supplied ranges.
+        ranges = []
+        prev_end = effective_tmin
+        for t0, t1 in chunk_ranges:
+            t0, t1 = float(t0), float(t1)
+            if t0 < prev_end or t1 <= t0 or t1 > effective_tmax:
+                raise ValueError(
+                    f'Invalid chunk_ranges: ({t0}, {t1}) overlaps or exceeds '
+                    f'overall tmin={effective_tmin}, tmax={effective_tmax}.'
+                )
+            ranges.append((t0, t1))
+            prev_end = t1
+
+    # If stitching, carve training window out of the chunk schedule.
+    apply_ranges = ranges
+    if train_range is not None:
+        apply_ranges = _subtract_range(ranges, train_range)
+        logger.info(
+            f'apply_templates_chunked: stitching training window '
+            f'[{train_range[0]:.1f}, {train_range[1]:.1f}]; '
+            f'{len(apply_ranges)} apply chunks after carve-out'
+        )
+
+    logger.info(
+        f'apply_templates_chunked: {len(apply_ranges)} apply chunk(s), '
+        f'chunk_hours={chunk_hours}, overall [{effective_tmin:.1f}, '
+        f'{effective_tmax:.1f}] s'
+    )
+
+    chunk_dirs = []
+    for k, (t0, t1) in enumerate(apply_ranges):
+        chunk_dir = results_dir / f'_chunk_{k:04d}'
+        logger.info(
+            f'Chunk {k+1}/{len(apply_ranges)}: tmin={t0:.1f} tmax={t1:.1f}'
+        )
+        apply_templates(
+            training_dir, filename, results_dir=chunk_dir,
+            tmin=t0, tmax=t1, device=device, file_object=file_object,
+            progress_bar=progress_bar, verbose_console=verbose_console,
+            torch_thread_lim=torch_thread_lim,
+        )
+        chunk_dirs.append(chunk_dir)
+
+    # Merge inputs: apply chunks plus optionally training_dir.
+    merge_inputs = list(chunk_dirs)
+    if train_range is not None:
+        merge_inputs.append(training_dir)
+    _merge_phy_chunks(
+        merge_inputs, results_dir,
+        filename=filename, effective_tmin=effective_tmin,
+        effective_tmax=effective_tmax,
+    )
+
+    if not keep_chunks:
+        for d in chunk_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+
+    logger.info(f'Merged phy output at {results_dir}')
+    return results_dir
+
+
+def _subtract_range(ranges, cut):
+    """Remove `cut = (c0, c1)` from an ordered list of disjoint `ranges`."""
+    c0, c1 = cut
+    out = []
+    for t0, t1 in ranges:
+        if t1 <= c0 or t0 >= c1:
+            out.append((t0, t1))
+            continue
+        if t0 < c0:
+            out.append((t0, c0))
+        if t1 > c1:
+            out.append((c1, t1))
+    return out
+
+
+def _merge_phy_chunks(input_dirs, out_dir, filename, effective_tmin,
+                      effective_tmax):
+    """Merge per-chunk phy directories into a single phy directory.
+
+    Assumes each `input_dir` is a complete phy output (as produced by
+    `apply_templates` or a prior KS4 run) and that their time ranges are
+    disjoint. Inputs are sorted by the minimum spike time found in each.
+    """
+    input_dirs = [Path(d) for d in input_dirs]
+
+    # Sort inputs by first spike time (equivalently by tmin of the chunk).
+    def _first_time(d):
+        st = np.load(d / 'spike_times.npy', mmap_mode='r')
+        return int(st[0]) if len(st) else np.iinfo(np.int64).max
+    input_dirs = sorted(input_dirs, key=_first_time)
+
+    per_spike_1d = [
+        'spike_times.npy', 'spike_clusters.npy', 'spike_templates.npy',
+        'spike_detection_templates.npy', 'amplitudes.npy', 'kept_spikes.npy',
+    ]
+    # spike_positions is (n_spikes, 2); handled separately.
+
+    # Concatenate the 1D per-spike arrays (already time-sorted within each
+    # chunk; chunks are time-disjoint so concatenation is sorted).
+    merged = {}
+    for name in per_spike_1d:
+        arrs = [np.load(d / name) for d in input_dirs]
+        merged[name] = np.concatenate(arrs, axis=0)
+    sp_arrs = [np.load(d / 'spike_positions.npy') for d in input_dirs]
+    merged['spike_positions.npy'] = np.concatenate(sp_arrs, axis=0)
+
+    # Cross-chunk dedup on the merged train.
+    ops = io.load_ops(input_dirs[0] / 'ops.npy', device=torch.device('cpu'))
+    dt = int(ops.get('duplicate_spike_bins', 15))
+    spike_times, spike_clusters, kept = postprocessing.remove_duplicates(
+        merged['spike_times.npy'], merged['spike_clusters.npy'], dt=dt,
+    )
+    logger.info(
+        f'_merge_phy_chunks: {len(spike_times)} spikes after cross-chunk '
+        f'dedup (removed {int((~kept).sum())})'
+    )
+
+    # Apply kept-mask to all per-spike arrays.
+    for name in per_spike_1d:
+        if name == 'spike_times.npy':
+            merged[name] = spike_times
+        elif name == 'spike_clusters.npy':
+            merged[name] = spike_clusters
+        elif name == 'kept_spikes.npy':
+            # Merged output: everything that survives dedup is "kept".
+            merged[name] = np.ones(len(spike_times), dtype=bool)
+        else:
+            merged[name] = merged[name][kept]
+    merged['spike_positions.npy'] = merged['spike_positions.npy'][kept]
+
+    # Save the merged 1D/2D per-spike arrays.
+    for name, arr in merged.items():
+        np.save(out_dir / name, arr)
+
+    # Merge pc_features.npy via a mmap-backed concatenation to avoid
+    # loading everything into RAM, then apply the kept-mask.
+    pc_shapes = [np.load(d / 'pc_features.npy', mmap_mode='r').shape
+                 for d in input_dirs]
+    total_pre = sum(s[0] for s in pc_shapes)
+    tail_shape = pc_shapes[0][1:]
+    pc_dtype = np.load(input_dirs[0] / 'pc_features.npy', mmap_mode='r').dtype
+    tmp_pc = out_dir / '_pc_features_concat.npy'
+    pc_cat = np.lib.format.open_memmap(
+        tmp_pc, mode='w+', dtype=pc_dtype,
+        shape=(total_pre,) + tail_shape,
+    )
+    offset = 0
+    for d, s in zip(input_dirs, pc_shapes):
+        chunk_pc = np.load(d / 'pc_features.npy', mmap_mode='r')
+        n = s[0]
+        pc_cat[offset:offset + n] = chunk_pc[:]
+        offset += n
+    pc_cat.flush()
+    del pc_cat
+    pc_cat = np.load(tmp_pc, mmap_mode='r')
+    # kept is over the pre-dedup order, same order as pc_cat. Write the
+    # final pc_features.npy in normal (non-mmap) form.
+    np.save(out_dir / 'pc_features.npy', np.asarray(pc_cat[kept]))
+    del pc_cat
+    tmp_pc.unlink()
+
+    # Copy cluster-level / channel-level / whitening files from first input.
+    # These are identical across chunks because Wall and the probe are fixed.
+    # For `stitch_training`, templates.npy (and the similarity matrix) from
+    # a regular apply chunk matches train_out's too because both were
+    # produced from the same frozen Wall.
+    copy_files = [
+        'templates.npy', 'templates_ind.npy', 'similar_templates.npy',
+        'pc_feature_ind.npy', 'channel_map.npy', 'channel_positions.npy',
+        'channel_shanks.npy', 'whitening_mat.npy', 'whitening_mat_inv.npy',
+        'whitening_mat_dat.npy',
+    ]
+    for f in copy_files:
+        src = input_dirs[0] / f
+        if src.exists():
+            shutil.copy(src, out_dir / f)
+
+    # Recompute cluster-level tsvs from merged spike train.
+    acg_t = ops['settings']['acg_threshold']
+    ccg_t = ops['settings']['ccg_threshold']
+    is_ref, est_contam = CCG.refract(
+        spike_clusters, spike_times / ops['fs'],
+        acg_threshold=acg_t, ccg_threshold=ccg_t,
+    )
+    # Template amplitudes (for cluster_Amplitude.tsv) can be read from
+    # any input's template_amplitudes via templates.npy norms.
+    templates = np.load(out_dir / 'templates.npy')
+    template_amplitudes = np.linalg.norm(templates, axis=(1, 2))
+    stypes = ['ContamPct', 'Amplitude', 'KSLabel']
+    ks_labels = [['mua', 'good'][int(r)] for r in is_ref]
+    props = [est_contam * 100, template_amplitudes, ks_labels]
+    for stype, prop in zip(stypes, props):
+        with open(out_dir / f'cluster_{stype}.tsv', 'w') as fh:
+            fh.write(f'cluster_id\t{stype}\n')
+            for i, p in enumerate(prop):
+                if stype != 'KSLabel':
+                    fh.write(f'{i}\t{p:.1f}\n')
+                else:
+                    fh.write(f'{i}\t{p}\n')
+    shutil.copyfile(out_dir / 'cluster_KSLabel.tsv',
+                    out_dir / 'cluster_group.tsv')
+
+    # Write params.py pointing at the full target filename list.
+    dtype = f"'{ops['data_dtype']}'"
+    dat_path = [Path(p).resolve().as_posix() for p in filename]
+    params = {
+        'n_channels_dat': ops['settings']['n_chan_bin'],
+        'offset': 0,
+        'sample_rate': ops['settings']['fs'],
+        'dtype': dtype,
+        'hp_filtered': False,
+        'dat_path': dat_path,
+    }
+    with open(out_dir / 'params.py', 'w') as fh:
+        for key in params:
+            fh.write(f'{key} = {params[key]}\n')
+
+    # Save a merged ops.npy with the full time range.
+    ops['filename'] = [Path(f) for f in filename]
+    ops['data_dir'] = Path(filename[0]).parent
+    ops['settings']['filename'] = ops['filename']
+    ops['settings']['data_dir'] = ops['data_dir']
+    ops['tmin'] = float(effective_tmin)
+    ops['tmax'] = float(effective_tmax)
+    ops['settings']['tmin'] = ops['tmin']
+    ops['settings']['tmax'] = ops['tmax']
+    ops['n_spikes'] = int(len(spike_times))
+    ops['n_units_total'] = int(len(is_ref))
+    ops['n_units_good'] = int(is_ref.sum())
+    io.save_ops(ops, out_dir)
 
 
 def set_files(settings, filename, probe, probe_name, data_dir, results_dir,
