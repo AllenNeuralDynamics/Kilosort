@@ -66,22 +66,28 @@ def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000):
     return kn, M
 
 
-def assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj, device=torch.device('cuda')):
+def assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj,
+                  device=torch.device('cuda'), chunk_size=2**18):
     n_spikes = kn.shape[0]
-
-    ij = torch.vstack((rows_neigh.flatten(), isub[kn].flatten()))
-    xN = coo(ij, tones2.flatten(), (n_spikes, nclust))
-    xN = xN.to_dense()
 
     if lam > 0:
         tones = torch.ones(len(kj), device = device)
         tzeros = torch.zeros(len(kj), device = device)
-        ij = torch.vstack((tzeros, isub))    
-        kN = coo(ij, tones, (1, nclust))
-    
-        xN = xN - lam/m * (ki.unsqueeze(-1) * kN.to_dense()) 
-    
-    iclust = torch.argmax(xN, 1)
+        ij = torch.vstack((tzeros, isub))
+        kN = coo(ij, tones, (1, nclust)).to_dense()
+
+    # Each spike's assignment depends only on its own row, so the dense
+    # (n_spikes, nclust) scores are built in row chunks: the full matrix and
+    # its temporaries exceed GPU memory for long, dense recordings.
+    iclust = torch.empty(n_spikes, dtype=torch.int64, device=device)
+    for i0 in range(0, n_spikes, chunk_size):
+        i1 = min(i0 + chunk_size, n_spikes)
+        ij = torch.vstack(((rows_neigh[i0:i1] - i0).flatten(),
+                           isub[kn[i0:i1]].flatten()))
+        xN = coo(ij, tones2[i0:i1].flatten(), (i1 - i0, nclust)).to_dense()
+        if lam > 0:
+            xN = xN - lam/m * (ki[i0:i1].unsqueeze(-1) * kN)
+        iclust[i0:i1] = torch.argmax(xN, 1)
 
     return iclust
 

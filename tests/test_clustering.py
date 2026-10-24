@@ -1,6 +1,9 @@
 import numpy as np
+import pytest
+import torch
+from torch import sparse_coo_tensor as coo
 
-from kilosort.clustering_qr import x_centers
+from kilosort.clustering_qr import x_centers, assign_iclust
 from kilosort.io import load_probe
 from kilosort.utils import PROBE_DIR
 
@@ -85,3 +88,36 @@ class TestCenters:
         # All centers should be within 2 microns of the true values
         print(f'centers: {centers}')
         assert np.allclose(np.sort(centers), np.sort([22, 272, 522, 772]), atol=5)
+
+
+def unchunked_assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m, ki,
+                            kj, device):
+    n_spikes = kn.shape[0]
+    ij = torch.vstack((rows_neigh.flatten(), isub[kn].flatten()))
+    xN = coo(ij, tones2.flatten(), (n_spikes, nclust)).to_dense()
+    if lam > 0:
+        tones = torch.ones(len(kj), device=device)
+        tzeros = torch.zeros(len(kj), device=device)
+        kN = coo(torch.vstack((tzeros, isub)), tones, (1, nclust))
+        xN = xN - lam/m * (ki.unsqueeze(-1) * kN.to_dense())
+    return torch.argmax(xN, 1)
+
+
+@pytest.mark.parametrize('lam', [0, 1])
+def test_assign_iclust_chunked_matches_unchunked(lam, torch_device):
+    rng = np.random.default_rng(0)
+    n_spikes, n_neigh, nsub, nclust = 10_007, 10, 500, 50
+    kn = torch.from_numpy(rng.integers(0, nsub, (n_spikes, n_neigh))).to(torch_device)
+    isub = torch.from_numpy(rng.integers(0, nclust, nsub)).to(torch_device)
+    ki = torch.from_numpy(rng.random(n_spikes)).float().to(torch_device)
+    kj = torch.from_numpy(rng.random(nsub)).float().to(torch_device)
+    m = float(n_spikes * n_neigh)
+    rows_neigh = torch.arange(n_spikes, device=torch_device).unsqueeze(-1).tile((1, n_neigh))
+    tones2 = torch.ones((n_spikes, n_neigh), device=torch_device)
+    args = (rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj)
+
+    expected = unchunked_assign_iclust(*args, device=torch_device)
+    # A chunk size that leaves a short final chunk.
+    actual = assign_iclust(*args, device=torch_device, chunk_size=1000)
+
+    assert torch.equal(actual, expected)
